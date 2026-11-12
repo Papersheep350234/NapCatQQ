@@ -1,0 +1,163 @@
+name: Sync upstream releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 4 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-releases
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'XingYunStar/NapCatQQ'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.RELEASE_SYNC_TOKEN }}
+
+      - name: Copy releases and assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: XingYunStar/NapCatQQ
+          DESTINATION: ${{ github.repository }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import tempfile
+          import time
+          import urllib.parse
+
+          source = os.environ['UPSTREAM']
+          target = os.environ['DESTINATION']
+          marker = f'<!-- release-mirror: {source} -->'
+
+          def run(*args):
+              return subprocess.check_output(args, text=True).strip()
+
+          def api(endpoint, data=None, method=None):
+              args = ['gh', 'api', endpoint]
+              if data is not None:
+                  args += ['--method', method or 'POST', '--input', '-']
+              result = subprocess.run(
+                  args, input=json.dumps(data) if data is not None else None,
+                  text=True, stdout=subprocess.PIPE, check=True)
+              return json.loads(result.stdout)
+
+          def listing(endpoint):
+              pages = json.loads(run('gh', 'api', endpoint + '?per_page=100',
+                                     '--paginate', '--slurp'))
+              return [item for page in pages for item in page]
+
+          releases = [r for r in listing(f'repos/{source}/releases') if not r['draft']]
+          existing = {r['tag_name']: r for r in listing(f'repos/{target}/releases')}
+          releases.sort(key=lambda r: r['published_at'] or r['created_at'])
+          latest_result = subprocess.run(['gh', 'api', f'repos/{source}/releases/latest'],
+                                         text=True, capture_output=True)
+          if latest_result.returncode == 0:
+              latest_tag = json.loads(latest_result.stdout)['tag_name']
+          elif 'HTTP 404' in latest_result.stderr:
+              latest_tag = None
+          else:
+              raise RuntimeError(latest_result.stderr)
+
+          # Keep upstream tags separate from local tags. Never force-push a tag.
+          run('git', 'fetch', '--no-tags', f'https://github.com/{source}.git',
+              '+refs/tags/*:refs/upstream-tags/*')
+          target_tags = {}
+          for line in run('git', 'ls-remote', '--tags', 'origin').splitlines():
+              sha, ref = line.split()
+              if not ref.endswith('^{}'):
+                  target_tags[ref.removeprefix('refs/tags/')] = sha
+
+          completed = 0
+          for release in releases:
+              tag = release['tag_name']
+              print(f'Processing {tag}', flush=True)
+              source_ref = 'refs/upstream-tags/' + tag
+              sha = run('git', 'rev-parse', '--verify', source_ref)
+              if tag in target_tags:
+                  if target_tags[tag] != sha:
+                      raise RuntimeError(f'Tag conflict: {tag}. No tag was overwritten.')
+              else:
+                  run('git', 'push', 'origin', f'{source_ref}:refs/tags/{tag}')
+                  target_tags[tag] = sha
+
+              dest = existing.get(tag)
+              if dest is None:
+                  body = (release['body'] or '') + '\n\n---\nSource: ' + release['html_url'] + '\n' + marker
+                  dest = api(f'repos/{target}/releases', {
+                      'tag_name': tag,
+                      'name': release['name'] or tag,
+                      'body': body,
+                      'draft': True,
+                      'prerelease': release['prerelease'],
+                      'make_latest': 'false',
+                  })
+                  existing[tag] = dest
+              elif marker not in (dest.get('body') or ''):
+                  print(f'Skipping existing release not created by this workflow: {tag}', flush=True)
+                  continue
+
+              assets = listing(f'repos/{source}/releases/{release["id"]}/assets')
+              copied = {a['name']: a for a in listing(f'repos/{target}/releases/{dest["id"]}/assets')}
+              for asset in assets:
+                  name = asset['name']
+                  previous = copied.get(name)
+                  if previous:
+                      if previous['size'] != asset['size'] or previous['state'] != 'uploaded':
+                          raise RuntimeError(f'Incomplete or changed asset: {tag}/{name}. Remove this destination asset and rerun.')
+                      if asset.get('digest') and previous.get('digest') and asset['digest'] != previous['digest']:
+                          raise RuntimeError(f'Changed asset: {tag}/{name}. No file was overwritten.')
+                      continue
+                  print(f'Copying {tag}/{name}', flush=True)
+                  with tempfile.TemporaryDirectory() as folder:
+                      path = pathlib.Path(folder) / 'asset.bin'
+                      for attempt in range(3):
+                          try:
+                              with path.open('wb') as output:
+                                  subprocess.run(['gh', 'api', f'repos/{source}/releases/assets/{asset["id"]}',
+                                                  '-H', 'Accept: application/octet-stream'], stdout=output, check=True)
+                              if path.stat().st_size != asset['size']:
+                                  raise RuntimeError('Downloaded size mismatch')
+                              if (asset.get('digest') or '').startswith('sha256:'):
+                                  with path.open('rb') as content:
+                                      digest = 'sha256:' + hashlib.file_digest(content, 'sha256').hexdigest()
+                                  if digest != asset['digest']:
+                                      raise RuntimeError('Downloaded checksum mismatch')
+                              break
+                          except (subprocess.CalledProcessError, RuntimeError):
+                              if attempt == 2:
+                                  raise
+                              time.sleep(5 * (attempt + 1))
+                      query = urllib.parse.urlencode({'name': name, 'label': asset.get('label') or ''})
+                      endpoint = f'https://uploads.github.com/repos/{target}/releases/{dest["id"]}/assets?{query}'
+                      subprocess.run(['gh', 'api', endpoint, '--method', 'POST',
+                                      '-H', 'Content-Type: application/octet-stream',
+                                      '--input', str(path), '--silent'], check=True)
+
+              if dest['draft']:
+                  api(f'repos/{target}/releases/{dest["id"]}',
+                      {'draft': False, 'make_latest': 'false'}, method='PATCH')
+              if tag == latest_tag and not release['prerelease']:
+                  api(f'repos/{target}/releases/{dest["id"]}',
+                      {'make_latest': 'true'}, method='PATCH')
+              completed += 1
+              time.sleep(1)
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(f'Processed {completed} releases from [{source}](https://github.com/{source}/releases).\n')
+          print(f'Done. Processed {completed} releases.', flush=True)
+          PY
