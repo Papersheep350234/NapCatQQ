@@ -96,8 +96,8 @@ jobs:
                   target_tags[tag] = sha
 
               dest = existing.get(tag)
+              body = release['body'] or ''
               if dest is None:
-                  body = (release['body'] or '') + '\n\n---\nSource: ' + release['html_url'] + '\n' + marker
                   dest = api(f'repos/{target}/releases', {
                       'tag_name': tag,
                       'name': release['name'] or tag,
@@ -107,9 +107,14 @@ jobs:
                       'make_latest': 'false',
                   })
                   existing[tag] = dest
-              elif marker not in (dest.get('body') or ''):
-                  print(f'Skipping existing release not created by this workflow: {tag}', flush=True)
+              elif marker not in (dest.get('body') or '') and (dest.get('body') or '') != body:
+                  print(f'Skipping existing release with different notes: {tag}', flush=True)
                   continue
+
+              # Migrate older mirrored notes to the exact upstream text.
+              if (dest.get('body') or '') != body:
+                  dest = api(f'repos/{target}/releases/{dest["id"]}',
+                             {'body': body}, method='PATCH')
 
               assets = listing(f'repos/{source}/releases/{release["id"]}/assets')
               copied = {a['name']: a for a in listing(f'repos/{target}/releases/{dest["id"]}/assets')}
